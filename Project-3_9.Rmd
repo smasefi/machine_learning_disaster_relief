@@ -1,0 +1,1140 @@
+---
+title: "6030_project"
+author: "Claire Sullivan, Terrance Luangrath, Katie Dunning, Samantha Asef"
+date: "2025-06-13"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(cache=TRUE, autodep=TRUE)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh")
+library(tidyverse)
+library(tidymodels)
+library(discrim)
+library(patchwork)
+library(glmnet)
+library(future)
+library(dplyr)
+library(knitr)
+library(kknn)
+```
+
+```{r setup parallel, include=FALSE, cache=FALSE}
+library(future)
+plan(multisession, workers = parallel::detectCores(logical = FALSE) - 2)
+```
+
+#PreProcessing
+
+```{r}
+# | message: false
+# | warning: false
+HaitiTrain<-read_csv("HaitiPixels.csv")
+```
+```{r}
+HaitiTrain<-HaitiTrain%>%
+  mutate(Class=ifelse(Class=="Blue Tarp", 1, 0))%>%
+  mutate(Class=factor(Class, levels=c(1,0), labels=c("Blue_Tarp", "Other")))
+```
+
+```{r, message=FALSE}
+name_column=c("ID","X","Y","Map_X","Map_y","Lat","Lon","Red","Green","Blue")
+
+OT1<-read_table("HoldOutData/orthovnir067_ROI_NOT_Blue_Tarps.txt", skip=8, col_names = name_column)
+
+OT2<-read_table("HoldOutData/orthovnir069_ROI_NOT_Blue_Tarps.txt", skip=8, col_names = name_column)
+
+OT3<-read_table("HoldOutData/orthovnir078_ROI_NON_Blue_Tarps.txt", skip=8, col_names = name_column)
+
+BT1<-read_table("HoldOutData/orthovnir067_ROI_Blue_Tarps.txt", skip=8, col_names = name_column)
+
+BT2<-read_table("HoldOutData/orthovnir069_ROI_Blue_Tarps.txt", skip=8, col_names = name_column)
+
+BT3<-read_table("HoldOutData/orthovnir078_ROI_Blue_Tarps.txt", skip=8, col_names = name_column)
+```
+
+```{r}
+Blue_Tarp<-bind_rows(BT1,BT2,BT3)%>%
+  mutate(class=1)
+
+Other<-bind_rows(OT1,OT2,OT3)%>%
+  mutate(class=0)
+
+Testdat <-bind_rows(Blue_Tarp, Other)%>%
+  mutate(class=factor(class, levels=c(1,0), labels=c("Blue_Tarp", "Other")))
+
+Testdat <- Testdat %>% rename(Class = class)
+```
+
+
+```{r density, fig.height=2.5, fig.width=8}
+
+g1<-ggplot(HaitiTrain)+
+
+  geom_density(aes(x=Red, color="red"), alpha=0.7)+
+
+  geom_density(aes(x=Green, color="green"), alpha=0.7)+
+
+  geom_density(aes(x=Blue, color="blue"), alpha=0.7)+
+
+  scale_color_manual(values=c("red"="red","green"="green","blue"="blue"),
+
+  limits=c("red","green","blue"))+
+
+  labs(title="Known RGB Haiti Train",x="RGB Values",y="Density")
+ 
+g2<-ggplot(Testdat)+
+
+  geom_density(aes(x=Red, color="red"), alpha=0.7)+
+
+  geom_density(aes(x=Green, color="green"), alpha=0.7)+
+
+  geom_density(aes(x=Blue, color="blue"), alpha=0.7)+
+
+  scale_color_manual(values=c("red"="red","green"="green","blue"="blue"),
+
+  limits=c("red","green","blue"))+
+
+  labs(title="Suspected RGB Haiti Test",x="RGB Values",y="Density")
+ 
+(g1+g2)
+
+```
+ 
+# Explotatory Data Analysis 
+
+```{r}
+#check for NA values
+sum(is.na(HaitiTrain))
+```
+
+```{r}
+#check for NA values
+sum(is.na(Testdat))
+```
+
+
+```{r}
+HaitiTrain %>%
+  count(Class)
+```
+```{r}
+Testdat %>%
+  count(Class)
+```
+
+```{r}
+g1 <- Testdat %>% 
+  ggplot(aes(x=Class, fill = Class)) + 
+  scale_y_log10() + 
+  scale_fill_manual(values = c("lightblue", "grey"), guide = "none") + 
+  geom_bar() + 
+  theme_bw() + 
+  labs(x= "Class", y="Count", title = "Holdout Data")
+g2 <- HaitiTrain %>% 
+  ggplot(aes(x=Class, fill = Class)) + 
+  scale_y_log10() + 
+  scale_fill_manual(values = c("lightblue", "grey"), guide = "none") + 
+  geom_bar() + 
+  theme_bw() + 
+  labs(x= "Class", y="Count", title = "Test Data")
+
+g1 + g2
+```
+
+
+
+```{r}
+#distribution of RGB for Blue Tarp and Other 
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# one RGB column
+HaitiLong <- HaitiTrain %>%
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Colors", values_to = "Value")
+TestLong <- Testdat %>%
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Colors", values_to = "Value")
+
+g3 <- ggplot(HaitiLong, aes(x = Value, color = Colors)) +
+  geom_density() +
+  facet_wrap(~Class) +
+  scale_color_manual(values = c("Red" = "red", "Green" = "green", "Blue" = "blue")) +
+  labs(color = "Color", x = "Values", y = "Density", title = "Training Data") +
+  theme_bw()
+
+g4 <- ggplot(TestLong, aes(x = Value, color = Colors)) +
+  geom_density() +
+  facet_wrap(~Class) +
+  scale_color_manual(values = c("Red" = "red", "Green" = "green", "Blue" = "blue")) +
+  labs(color = "Color", x = "Values", y = "Density", title = "Holdout Data") +
+  theme_bw()
+
+(g3 + g4) + plot_layout(guides = "collect")
+```
+
+```{r}
+HaitiRatio <- HaitiTrain %>% 
+  mutate(BlueGreen = (Blue/Green)) %>% 
+  mutate(BlueRed = (Blue/Red)) %>% 
+  select(-Blue, -Red, -Green)
+```
+
+```{r}
+TestRatio <- Testdat %>% 
+  mutate(BlueGreen = (Blue/Green)) %>% 
+  mutate(BlueRed = (Blue/Red)) %>% 
+  select(-Blue, -Red, -Green)
+```
+```{r}
+HaitiRatio2 <- HaitiRatio %>% 
+  pivot_longer(cols = c(BlueGreen, BlueRed), names_to = "Color_Ratios", values_to = "Value")
+```
+```{r}
+TestRatio2 <- TestRatio %>% 
+  pivot_longer(cols = c(BlueGreen, BlueRed), names_to = "Color_Ratios", values_to = "Value")
+```
+
+
+```{r}
+ggplot(HaitiRatio2, aes(x = Class, y = Value)) + 
+  geom_boxplot()+ 
+  facet_wrap(~Color_Ratios) + 
+  theme_bw()
+```
+
+
+```{r}
+g5 <- ggplot(HaitiRatio, aes(x = BlueGreen, y = BlueRed, color = Class)) + 
+  geom_point(alpha = 0.1)+ 
+  scale_color_manual(values = c("blue", "darkgrey"))+
+  theme_bw()
+g6 <- ggplot(TestRatio, aes(x = BlueGreen, y = BlueRed, color = Class)) + 
+  geom_point(alpha = 0.1)+ 
+  scale_color_manual(values = c("blue", "darkgrey"))+
+  theme_bw()
+
+(g5 + g6) + plot_layout(guides = "collect")
+```
+```{r}
+g5 <- ggplot(HaitiRatio, aes(x = BlueGreen, y = BlueRed, color = Class)) + 
+  geom_density_2d(bins=20) +
+  scale_color_manual(values = c("lightblue", "darkgrey"))+
+  theme_bw() + 
+  labs(x = "BlueGreen", y = "BlueRed", title = "Training Data")
+g6 <- ggplot(TestRatio, aes(x = BlueGreen, y = BlueRed, color = Class)) + 
+  geom_density_2d(bins=20) +
+  scale_color_manual(values = c("lightblue", "darkgrey"))+
+  theme_bw()+ 
+  labs(x = "BlueGreen", y = "BlueRed", title = "Holdout Data")
+g7 <- ggplot(HaitiRatio, aes(x = BlueGreen, y = BlueRed, color = Class)) + 
+  geom_point(alpha = 0.1)+ 
+  scale_color_manual(values = c("lightblue", "darkgrey"), guide = "none")+
+  theme_bw()+ 
+  labs(x = "BlueGreen", y = "BlueRed", title = "Training Data")
+g8 <- ggplot(TestRatio, aes(x = BlueGreen, y = BlueRed, color = Class)) + 
+  geom_point(alpha = 0.1)+ 
+  scale_color_manual(values = c("lightblue", "darkgrey"), guide = "none")+
+  theme_bw()+ 
+  labs(x = "BlueGreen", y = "BlueRed", title = "Holdout Data")
+
+((g5 + g6) + plot_layout(guides = "collect")) / ((g7+ g8) + plot_layout(guides = "collect")) 
+```
+
+
+# Tuning Models: 
+
+### Recipe, Model Specs
+```{r}
+sapply(HaitiTrain, class)
+```
+```{r}
+formula <- Class ~ . 
+rec <- recipe(formula, data=HaitiTrain) %>%
+    step_normalize(all_numeric_predictors()) %>% 
+    step_dummy(all_nominal_predictors())
+```
+```{r}
+#LDA 
+lda_spec <- discrim_linear(mode = "classification", engine = "MASS")
+
+#QDA 
+qda_spec <- discrim_quad(mode = "classification", engine = "MASS")
+
+#KNN 
+knn_spec <- nearest_neighbor(engine="kknn", mode="classification",neighbors=tune())
+#LR
+logreg_spec <- logistic_reg(engine="glmnet", mode="classification", penalty=tune(), mixture=tune())
+#RF
+rf_spec <- rand_forest(
+  mode = "classification",
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune()
+  )
+#SVM
+poly_spec <- svm_poly(mode = "classification",
+                      cost = tune(),
+                      scale_factor = tune(), 
+                      degree = tune()) %>% 
+  set_engine("kernlab")
+
+```
+
+### Workflow
+```{r}
+#LDA 
+lda_workflow <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lda_spec)
+
+#QDA 
+qda_workflow <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(qda_spec)
+
+#KNN 
+knn_wf <- workflow() %>%
+    add_recipe(rec) %>%
+    add_model(knn_spec)
+#LR
+logreg_wf <- workflow() %>%
+    add_recipe(rec) %>%
+    add_model(logreg_spec)
+#RF
+rf_wf <- workflow() %>% 
+  add_recipe(rec) %>% 
+  add_model(rf_spec %>% 
+              set_engine("ranger", importance="impurity"))
+#SVM
+svm_wf <- workflow() %>% 
+  add_recipe(rec) %>% 
+  add_model(poly_spec)
+```
+
+### Defining Parameters 
+
+```{r}
+#LDA 
+# No parameters for LDA
+
+#QDA 
+# No parameters for QDA
+
+#KNN 
+knn_params <- extract_parameter_set_dials(knn_wf) %>%
+    update(neighbors=neighbors(c(2, 40)))
+#LR
+logreg_params <- extract_parameter_set_dials(logreg_wf) %>%
+    update(
+        penalty=penalty(c(-3, 1)),
+        mixture=mixture(c(0, 1)))
+#RF
+rf_params <- extract_parameter_set_dials(rf_wf) %>%
+  update(
+    mtry=mtry(c(1, 3)),
+    min_n=min_n(c(2, 40))
+  )
+#SVM
+svm_params <- extract_parameter_set_dials(svm_wf) %>%
+  update(
+    cost=cost(c(-10, 5)),
+    degree=degree(c(1, 3)), 
+    scale_factor=scale_factor(c(-10, -1))
+  )
+```
+
+### CV Folds, Resamples, Controls 
+
+```{r}
+set.seed(6030)
+resamples <- vfold_cv(HaitiTrain, v=10, strata=Class)
+mycontrols = control_resamples(save_pred = TRUE)
+#saves OOF
+mymetrics = metric_set(roc_auc, f_meas)
+```
+
+### Tuning Hyperparameters
+```{r, message=FALSE, warning=FALSE}
+#library(doParallel)
+#registerDoParallel(cores = parallel::detectCores() - 1)
+set.seed(6030)
+#KNN
+nn_results <- tune_grid(knn_wf,
+    resamples=resamples,
+    control=mycontrols,
+    metrics = mymetrics,
+    grid=grid_latin_hypercube(knn_params, size = 20))
+#LR
+logreg_results <- tune_grid(logreg_wf,
+    resamples=resamples,
+    control=mycontrols,
+    metrics = mymetrics,
+    grid=grid_latin_hypercube(logreg_params, size = 20))
+
+#RF
+rf_results <- tune_grid(
+  rf_wf,
+  resamples=resamples,
+  control=mycontrols,
+  metrics=mymetrics,
+  grid=grid_latin_hypercube(rf_params, size = 20)
+)
+
+#SVM
+svm_results <- tune_grid(
+  svm_wf,
+  resamples=resamples,
+  control=mycontrols,
+  metrics=mymetrics,
+  grid=grid_latin_hypercube(svm_params, size = 20)
+)
+```
+
+### Evaluating Initial Parameter Range
+
+```{r}
+#KNN
+knn_best_params<- show_best(nn_results, metric="roc_auc", n=1)
+```
+```{r}
+knn_best_params
+```
+```{r}
+autoplot(nn_results)
+```
+```{r}
+#LR
+logreg_best_params <- show_best(logreg_results, metric="roc_auc", n=1)
+```
+```{r}
+logreg_best_params
+```
+```{r}
+autoplot(logreg_results)
+```
+```{r}
+#RF 
+rf_best_params <- show_best(rf_results, metric="roc_auc", n=1)
+rf_best_params
+```
+```{r}
+autoplot(rf_results) +
+  labs(title="Random Forest Tuning Results")
+```
+```{r}
+#SVM
+svm_best_params <- show_best(svm_results, metric="roc_auc", n=1)
+svm_best_params
+```
+```{r}
+autoplot(svm_results) + 
+  labs(title="SVM-Poly Tuning Results")
+```
+
+
+
+### RE- Defining Parameters 
+
+```{r}
+#KNN
+knn_params <- extract_parameter_set_dials(knn_wf) %>%
+    update(neighbors=neighbors(c(2, 20)))
+#LR
+logreg_params <- extract_parameter_set_dials(logreg_wf) %>%
+    update(
+        penalty=penalty(c(-5, 1)),
+        # penalty is on a log 10 scale 
+        mixture=mixture(c(0, 1)))
+        # based on a mixture of L1 and L2 
+```
+
+### Tuning Hyperparameters - with updated Parameters and CV resamples (LDA/QDA)
+
+```{r, message=FALSE, warning=FALSE}
+#library(doParallel)
+#registerDoParallel(cores = parallel::detectCores() - 1)
+set.seed(6030)
+#LDA
+lda_cv <- fit_resamples(lda_workflow, resamples, 
+                        metrics=mymetrics, 
+                        control=mycontrols)
+#QDA
+qda_cv <- fit_resamples(qda_workflow, 
+                        resamples, 
+                        metrics=mymetrics, 
+                        control=mycontrols)
+#KNN
+nn_results <- tune_grid(knn_wf,
+    resamples=resamples,
+    control=mycontrols,
+    metrics = mymetrics,
+    grid=grid_latin_hypercube(knn_params, size = 20))
+#LR
+logreg_results <- tune_grid(logreg_wf,
+    resamples=resamples,
+    control=mycontrols,
+    metrics = mymetrics,
+    grid=grid_latin_hypercube(logreg_params, size = 20))
+```
+
+### Evaluating Updated Parameter Range
+```{r}
+#KNN
+knn_best_params<- show_best(nn_results, metric="roc_auc", n=1)
+```
+```{r}
+knn_best_params
+```
+```{r}
+autoplot(nn_results)
+```
+```{r}
+#LR
+logreg_best_params <- show_best(logreg_results, metric="roc_auc", n=1)
+```
+```{r}
+autoplot(logreg_results)
+```
+```{r}
+logreg_best_params
+```
+
+### Collect predictions for out-of-fold predictions
+
+```{r}
+#LDA and QDA
+lda_preds<-collect_predictions(lda_cv)
+qda_preds<-collect_predictions(qda_cv)
+```
+
+```{r}
+#KNN 
+KNN_preds <- collect_predictions(nn_results) %>% 
+  filter(neighbors == knn_best_params$neighbors) 
+#LR
+LR_preds <- collect_predictions(logreg_results) %>% 
+  filter(penalty == logreg_best_params$penalty, mixture == logreg_best_params$mixture) 
+#RF
+rf_preds <- collect_predictions(rf_results) %>% 
+  filter(mtry == rf_best_params$mtry, min_n == rf_best_params$min_n)
+#SVM
+svm_preds <-collect_predictions(svm_results) %>% 
+  filter(cost == svm_best_params$cost, 
+         degree == svm_best_params$degree,
+         scale_factor == svm_best_params$scale_factor)
+
+```
+
+### CV ROC Curve
+
+```{r}
+roc_cv_data<-function(model_pred, model_name) {
+  roc_data<-model_pred%>%
+    roc_curve(truth=Class, .pred_Blue_Tarp, event_level="first")%>%
+    mutate(Model=model_name)
+  return(roc_data)
+}
+```
+
+```{r}
+roc_dat<-bind_rows(
+  roc_cv_data(lda_preds, "LDA Model"),
+  roc_cv_data(qda_preds, "QDA Model"),
+  roc_cv_data(KNN_preds, "KNN Model"),
+  roc_cv_data(LR_preds, "Pen Logistic Mod"),
+  roc_cv_data(rf_preds, "Random Forest Mod"),
+  roc_cv_data(svm_preds, "SVM Polynomial Mod")
+)
+
+roc_cv_g<-ggplot(roc_dat, aes(x=1 - specificity, y=sensitivity, color=Model))+
+                   geom_line()+
+                   theme(aspect.ratio = 1)
+
+roc_cv_g_zoom <- roc_cv_g+
+  coord_cartesian(xlim=c(0,0.15),
+                  ylim=c(0.85,1))+
+                  guides(color="none")
+
+roc_cv_g+roc_cv_g_zoom
+```
+
+### Thresholding on OOF predictions 
+
+```{r function 1}
+
+# Threshold graphs function
+
+threshold_graph<-function(OOF,model_name){
+  performance<-probably::threshold_perf(OOF, Class, .pred_Blue_Tarp,
+    thresholds=seq(0.001,0.5,0.001), event_level="first",
+    metrics=metric_set(f_meas,accuracy,j_index,sensitivity))
+  max_metrics<-performance%>%
+    drop_na()%>%
+    group_by(.metric)%>%
+    filter(.estimate==max(.estimate))
+ g<-ggplot(performance,aes(x=.threshold,y=.estimate,color=.metric))+
+   geom_line()+
+   geom_point(data=max_metrics, color="black")+
+   labs(title=model_name,x="Threshold",y="Metricvalue")
+   #coord_cartesian(ylim=c(0,0.825))
+ thresholds<-max_metrics%>%
+   dplyr::select(.metric,.threshold)%>%
+   deframe()
+ return(list(graph=g,thresholds=thresholds))
+ }
+```
+
+```{r function 2}
+
+# Confusion Matrix Function
+
+ visualize_conf_mat<-function(OOF,thresholds,metric){
+   threshold<-thresholds[metric]
+   cm<-OOF%>%
+     mutate(
+       .pred_class=probably::make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp","Other"),
+                                                 threshold=threshold),
+       )%>%
+     conf_mat(truth=Class,estimate=.pred_class)
+ autoplot(cm,type="heatmap")+
+ labs(title=sprintf("Threshold%.2f(%s)",threshold,metric))
+ }
+```
+
+```{r function 3}
+
+# Putting graphs and model together
+
+ overview_model<-function(OOF,model_name){
+ tg<-threshold_graph(OOF,model_name)
+ g1<-visualize_conf_mat(OOF,tg$thresholds,"accuracy")
+ g2<-visualize_conf_mat(OOF,tg$thresholds,"f_meas")
+ g3<-visualize_conf_mat(OOF,tg$thresholds,"j_index")
+ g4<-visualize_conf_mat(OOF,tg$thresholds,"sensitivity")
+ tg$graph+(g1/g2/g3/g4)
+ }
+```
+
+```{r}
+
+# Making visualization for KNN and Logreg with all ideal thresholds.
+#LDA 
+gldathresh<-overview_model(lda_preds, "LDA Model")
+
+#QDA 
+gqdathresh<-overview_model(qda_preds, "QDA Model")
+
+#KNN 
+gknnthresh<-overview_model(KNN_preds, "KNN Model")
+
+#LR
+glogithresh<-overview_model(LR_preds, "Pen Logistic Model")
+
+#RF
+grfthresh <- overview_model(rf_preds, "Random Forest")
+
+#SVM
+gsvmthresh <- overview_model(svm_preds, "SVM Poly")
+```
+```{r, fig.width=8, fig.height=14}
+(gldathresh/gqdathresh/gknnthresh)
+```
+```{r, fig.width=8, fig.height=14}
+(glogithresh/grfthresh/gsvmthresh)
+```
+
+### Combined threshold graph
+
+```{r}
+plot_optimal_f1 <- function(OOF, model_name){
+  probably::threshold_perf(
+    .data=OOF,
+    truth=Class,
+    estimate=.pred_Blue_Tarp,
+    thresholds=seq(0.001, 0.5, 0.001),
+    metrics=metric_set(f_meas)
+  ) %>% 
+    filter(.metric=="f_meas") %>%
+    transmute(
+      threshold=.threshold,
+      f1=.estimate,
+      model=model_name
+    )
+}
+
+all_f1 <- bind_rows(
+  plot_optimal_f1(lda_preds, "LDA"),
+  plot_optimal_f1(qda_preds, "QDA"),
+  plot_optimal_f1(KNN_preds,  "KNN"),
+  plot_optimal_f1(LR_preds, "Penalized LR"),
+  plot_optimal_f1(rf_preds, "Random Forest"),
+  plot_optimal_f1(svm_preds, "SVM Poly")
+)
+
+ggplot(all_f1, aes(x = threshold, y = f1, color = model)) +
+  geom_line() +
+  geom_point(
+    data=all_f1 %>%
+      group_by(model) %>%  
+      filter(f1 == max(f1)),
+    aes(x=threshold, y=f1),
+    colour="black",
+    size=3) +
+  labs(
+    title="Optimal F1 vs Threshold by Model",
+    x="Threshold",
+    y="F1 Score"
+  )
+```
+
+### Extract F-measure thresholds
+
+```{r}
+# Make metric object
+ldathreshtest <- probably::threshold_perf(
+  lda_preds,
+  truth = Class,
+  estimate = .pred_Blue_Tarp,
+  thresholds = seq(0.001, 0.5, 0.001),
+  metrics = metric_set(accuracy, f_meas, j_index, sensitivity))
+
+#QDA 
+qdathreshtest <- probably::threshold_perf(
+  qda_preds,
+  truth = Class,
+  estimate = .pred_Blue_Tarp,
+  thresholds = seq(0.001, 0.5, 0.001),
+  metrics = metric_set(accuracy, f_meas, j_index, sensitivity))
+
+#KNN 
+knnthreshtest <- probably::threshold_perf(
+  KNN_preds,
+  truth = Class,
+  estimate = .pred_Blue_Tarp,
+  thresholds = seq(0.001, 0.5, 0.001),
+  metrics = metric_set(accuracy, f_meas, j_index, sensitivity))
+
+#LR
+penlogithreshtest <- probably::threshold_perf(
+  LR_preds,
+  truth = Class,
+  estimate = .pred_Blue_Tarp,
+  thresholds = seq(0.001, 0.5, 0.001),
+  metrics = metric_set(accuracy, f_meas, j_index, sensitivity))
+
+#RF
+rfthreshtest <- probably::threshold_perf(
+  rf_preds,
+  truth = Class,
+  estimate = .pred_Blue_Tarp,
+  thresholds = seq(0.001,0.5,0.001),
+  metrics = metric_set(accuracy, f_meas, j_index, sensitivity))
+
+#SVM
+svmthreshtest <- probably::threshold_perf(
+  svm_preds,
+  truth = Class,
+  estimate = .pred_Blue_Tarp,
+  thresholds = seq(0.001,0.5,0.001),
+  metrics = metric_set(accuracy, f_meas, j_index, sensitivity))
+```
+
+```{r}
+# Pull F-measure threshold  
+
+#LDA 
+lda_opt<-ldathreshtest%>%
+  filter(.metric=="f_meas")%>%
+  arrange(-.estimate)%>%
+  first()
+
+lda_best_thresh<-lda_opt$.threshold
+
+#QDA 
+qda_opt<-qdathreshtest%>%
+  filter(.metric=="f_meas")%>%
+  arrange(-.estimate)%>%
+  first()
+
+qda_best_thresh<-qda_opt$.threshold
+
+#KNN
+knn_opt<-knnthreshtest%>%
+  filter(.metric=="f_meas")%>%
+  arrange(-.estimate)%>%
+  first()
+
+knn_best_thresh<-knn_opt$.threshold
+
+#LR 
+penlogi_opt<-penlogithreshtest%>%
+  filter(.metric=="f_meas")%>%
+  arrange(-.estimate)%>%
+  first()
+
+penlogi_best_thresh<-penlogi_opt$.threshold
+
+#RF
+rf_opt <- rfthreshtest %>%
+  filter(.metric=="f_meas") %>%
+  arrange(-.estimate) %>%
+  first()
+
+rf_best_thresh<-rf_opt$.threshold
+
+#SVM
+svm_opt <- svmthreshtest %>%
+  filter(.metric=="f_meas") %>%
+  arrange(-.estimate) %>%
+  first()
+
+svm_best_thresh<-svm_opt$.threshold
+
+```
+
+### Finalize WF & Fit train data
+
+```{r}
+#LDA 
+lda_final_model <- fit(lda_workflow, data = HaitiTrain)
+
+#QDA 
+qda_final_model <- fit(qda_workflow, data = HaitiTrain)
+
+#KNN
+knn_final_model<- finalize_workflow(knn_wf, select_best(nn_results, metric = "roc_auc")) %>%
+  fit(data = HaitiTrain)
+#LR
+logreg_final_model<- finalize_workflow(logreg_wf, select_best(logreg_results, metric = "roc_auc")) %>%
+  fit(data = HaitiTrain)
+#RF
+rf_final_model <- finalize_workflow(rf_wf, select_best(rf_results, metric="roc_auc")) %>% 
+  fit(data=HaitiTrain)
+#SVM
+svm_final_model <- finalize_workflow(svm_wf, select_best(svm_results, metric="roc_auc")) %>%
+  fit(data=HaitiTrain)
+```
+
+### CV performance with resamples
+
+```{r}
+knn_resamp_only<-finalize_workflow(knn_wf, select_best(nn_results, metric = "roc_auc"))
+logreg_resamp_only<-finalize_workflow(logreg_wf, select_best(logreg_results, metric = "roc_auc"))
+rf_resamp_only<-finalize_workflow(rf_wf, select_best(rf_results, metric="roc_auc"))
+svm_resamp_only<-finalize_workflow(svm_wf, select_best(svm_results, metric="roc_auc"))
+
+knn_resamp<-fit_resamples(knn_resamp_only, resamples, metrics=mymetrics, control=mycontrols)
+logreg_resamp<-fit_resamples(logreg_resamp_only, resamples, metrics=mymetrics, control=mycontrols)
+rf_resamp<-fit_resamples(rf_resamp_only, resamples, metrics=mymetrics, control=mycontrols)
+svm_resamp<-fit_resamples(svm_resamp_only, resamples, metrics=mymetrics, control=mycontrols)
+
+bind_rows(
+        collect_metrics(lda_cv) %>%
+        mutate(model="LDA"),
+        collect_metrics(qda_cv) %>%
+        mutate(model="QDA"),
+        collect_metrics(knn_resamp)%>%
+        mutate(model="KNN"),
+        collect_metrics(logreg_resamp)%>%
+        mutate(model="Pen Logistic"),
+        collect_metrics(rf_resamp)%>%
+        mutate(model="Random Forest"),
+        collect_metrics(svm_resamp)%>%
+        mutate(model="SVM Polynomial")
+)%>%
+  select(model, .metric, mean)%>%
+  pivot_wider(names_from = .metric, values_from = mean)%>%
+  knitr::kable(caption="Cross-Validiation Performance All Models")
+```
+
+
+### Predicted probabilities with test data 
+
+### Apply optimized threshold to the test preds to get a classification for test data 
+
+```{r thresh forms}
+predict_at_threshold <- function(model, data, threshold) {
+    return(
+        model %>%
+            augment(data) %>%
+            mutate(.pred_class = probably::make_two_class_pred(.pred_Blue_Tarp,
+                    c("Blue_Tarp","Other"), threshold=threshold)))}
+
+calculate_metrics_at_threshold <- function(model, train, test, model_name, threshold, met_set) {
+    bind_rows(
+      bind_cols(
+            model=model_name, dataset="train", threshold=threshold,
+            met_set(predict_at_threshold(model, train, threshold), 
+                truth=Class, estimate=.pred_class, event_level="first"),
+        ),
+    bind_cols(model=model_name,dataset="train",threshold=threshold,
+              roc_auc(model %>%augment(train),Class,.pred_Blue_Tarp,event_level="first"),
+        ),
+    bind_cols(
+            model=model_name, dataset="test", threshold=threshold,
+            met_set(predict_at_threshold(model, test, threshold), 
+                truth=Class, estimate=.pred_class, event_level="first"),
+        ),
+    bind_cols(
+      model=model_name,dataset="test",threshold=threshold,
+      roc_auc(model %>%augment(test),Class,.pred_Blue_Tarp,event_level="first"),))}
+
+ metrics_table<-function(model_metrics,caption){
+   model_metrics %>%
+     pivot_wider(names_from=.metric,values_from=.estimate)%>%
+     select(-.estimator)%>%
+     knitr::kable(caption=caption,digits=3,longtable=FALSE) %>%
+     kableExtra::kable_styling(full_width=FALSE) }
+```
+
+```{r}
+met_set<-metric_set(accuracy,kap,j_index,f_meas,sensitivity)
+
+# ADD LDA, QDA, RANDOM FOREST, SVM
+metrics_at_threshold<-bind_rows(  
+  calculate_metrics_at_threshold(lda_final_model, HaitiTrain, Testdat, "LDA Model", lda_best_thresh,met_set),
+  calculate_metrics_at_threshold(qda_final_model, HaitiTrain, Testdat, "QDA Model", qda_best_thresh,met_set),
+  calculate_metrics_at_threshold(knn_final_model, HaitiTrain, Testdat, "KNN Model", knn_best_thresh,met_set),
+calculate_metrics_at_threshold(logreg_final_model, HaitiTrain, Testdat, "Penalized Logreg Model", penlogi_best_thresh,met_set),
+  calculate_metrics_at_threshold(rf_final_model, HaitiTrain, Testdat, "Random Forest Mod",
+rf_best_thresh,met_set),
+  calculate_metrics_at_threshold(svm_final_model, HaitiTrain, Testdat, "SVM Poly Model",
+svm_best_thresh,met_set)
+)
+
+metrics_table(metrics_at_threshold, "Performance Metrics for All Models at Thresholds")
+```
+
+### Graph for the difference in train and test
+
+```{r}
+graph_fscore<-metrics_at_threshold%>%
+  pivot_wider(names_from=.metric,values_from=.estimate)%>%
+  select(model,dataset,f_meas)%>%
+  pivot_wider(names_from=dataset, values_from=f_meas)%>%
+  mutate(difference=train-test)%>%
+  mutate(model=factor(model, levels=c("Random Forest Mod", "LDA Model",
+                            "KNN Model", "SVM Poly Model",
+                            "Penalized Logreg Model","QDA Model")))
+```
+
+```{r}
+ggplot(graph_fscore, aes(x=model, y=difference, fill=model))+
+  geom_bar(stat="identity")+
+  labs(x="Model",y="F-Measure Difference",
+       title="Training/Testing Differences in  F-Measure")+
+  scale_fill_manual(values=c("Random Forest Mod"="firebrick",
+                             "LDA Model"="firebrick",
+                             "KNN Model"="firebrick",
+                             "SVM Poly Model"="firebrick",
+                             "Penalized Logreg Model"="cadetblue",
+                             "QDA Model"="cadetblue"))+
+  geom_smooth(aes(group=1),method="loess", se=FALSE,
+              color="black")+
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+  
+```
+
+### Heatmap Graph for Test data
+
+```{r}
+metrics_wide <- metrics_at_threshold %>%
+  filter(dataset=="test") %>% 
+  select(model, dataset, .metric, .estimate) %>% 
+  pivot_wider(
+    names_from=.metric,
+    values_from=.estimate
+  )
+
+perf_long <- metrics_wide %>%
+  pivot_longer(
+    cols = -c(model, dataset),
+    names_to  = "metric",
+    values_to = "value"
+  )
+
+ggplot(perf_long, aes(x = metric, y = model, fill = value)) +
+  geom_tile(color="white", size=0.2) +
+  scale_fill_viridis_c(option = "A", name = NULL, limits = c(0, 1)) +
+  labs(
+    title = "Test Set Performance by Metric & Dataset",
+    x=NULL,
+    y=NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid       = element_blank())
+```
+
+### Precision recall curve for test data
+```{r}
+bind_rows(
+  augment(lda_final_model,Testdat)%>%
+    mutate(model="LDA Model"),
+  augment(qda_final_model,Testdat)%>%
+    mutate(model="QDA Model"),
+  augment(knn_final_model,Testdat)%>%
+    mutate(model="KNN Model"),
+  augment(logreg_final_model,Testdat)%>%
+    mutate(model="Pen Logistic Model"),
+  augment(rf_final_model,Testdat)%>%
+    mutate(model="Random Forest Mod"),
+  augment(svm_final_model,Testdat)%>%
+    mutate(model="SVM Poly Model")
+)%>%
+  group_by(model)%>%
+  pr_curve(truth=Class, .pred_Blue_Tarp, event_level="first")%>%
+  autoplot()+
+  geom_abline(intercept = 1, slope = -1, linetype="dashed")+
+  labs(x="recall",y="precision",
+       title="Precision-Recall Curve for Test Data")
+```
+
+### Scatter Graph for Final Data
+
+```{r}
+testmets1 <- metric_set(f_meas, kap, j_index)
+
+testmets2 <- function(model, model_name) {
+  bind_rows(
+    testmets1(augment(model, HaitiTrain), truth = Class, estimate = .pred_class) %>% 
+    mutate(model = model_name, dataset = "Train"),
+    testmets1(augment(model, Testdat), truth = Class, estimate = .pred_class) %>% 
+    mutate(model = model_name, dataset = "Test"),
+  )
+}
+```
+
+```{r}
+ldascatter <- testmets2(lda_final_model, "LDA")
+qdascatter <- testmets2(qda_final_model, "QDA")
+knnscatter <- testmets2(knn_final_model, "KNN")
+lrscatter<- testmets2(logreg_final_model, "Log Reg")
+rfscatter<- testmets2(rf_final_model, "Random Forest")
+svmscatter <- testmets2(svm_final_model, "SVM")
+ 
+allmets <- bind_rows(ldascatter, qdascatter, knnscatter, lrscatter, rfscatter, svmscatter)
+
+allmets<- allmets %>% 
+  pivot_wider(names_from=.metric,values_from=.estimate)%>%
+  select(-.estimator)
+
+```
+
+```{r, fig.width=8, fig.height=14}
+gs1 <- ggplot(allmets, aes(x=f_meas, y=model, color=dataset)) +
+    geom_point() + 
+  theme_bw()
+
+gs2 <- ggplot(allmets, aes(x=kap, y=model, color=dataset)) +
+    geom_point() + 
+  theme_bw()
+
+gs3 <- ggplot(allmets, aes(x=j_index, y=model, color=dataset)) +
+    geom_point() + 
+  theme_bw()
+
+gs1 / gs2 / gs3 
+```
+
+### Computer performance on the test data 
+
+Confusion matrix, etc. here 
+
+```{r}
+conf_mat_lda<-predict_at_threshold(lda_final_model, Testdat, lda_best_thresh)%>%
+  conf_mat(truth=Class, estimate=.pred_class)
+conf_mat_qda<-predict_at_threshold(qda_final_model, Testdat, qda_best_thresh)%>%
+  conf_mat(truth=Class, estimate=.pred_class)
+conf_mat_knn<-predict_at_threshold(knn_final_model, Testdat, knn_best_thresh)%>%
+  conf_mat(truth=Class, estimate=.pred_class)
+conf_mat_logreg<-predict_at_threshold(logreg_final_model, Testdat, penlogi_best_thresh)%>%
+  conf_mat(truth=Class, estimate=.pred_class)
+conf_mat_rf<-predict_at_threshold(rf_final_model, Testdat, rf_best_thresh)%>%
+  conf_mat(truth=Class, estimate=.pred_class)
+conf_mat_svm<-predict_at_threshold(svm_final_model, Testdat, svm_best_thresh)%>%
+  conf_mat(truth=Class, estimate=.pred_class)
+
+#LDA
+cmlda<-autoplot(conf_mat_lda, type="heatmap") + labs(title="LDA Matrix")
+
+#QDA
+cmqda<-autoplot(conf_mat_qda, type="heatmap") + labs(title="QDA Matrix")
+
+#KNN
+cmk<-autoplot(conf_mat_knn, type="heatmap") + labs(title="KNN Matrix")
+
+#LR
+cmlr<-autoplot(conf_mat_logreg, type="heatmap") + labs(title="Logreg Matrix")
+
+#RF
+cmrf <- autoplot(conf_mat_rf, type="heatmap") + 
+  labs(title="Random Forest Matrix")
+
+#SVM
+cmsvm <- autoplot(conf_mat_svm, type="heatmap") + 
+  labs(title="SVM Poly Matrix")
+
+(cmlda+cmqda)/
+(cmk+cmlr)/
+(cmrf+cmsvm) 
+```
+
+
+```{r}
+compare_test_results <- function(model, new_data, truth_col, model_name = "Model") {
+  preds <- predict(model, new_data, type = "prob") %>%
+    bind_cols(predict(model, new_data)) %>%
+    bind_cols(new_data %>% select({{truth_col}})) %>%
+    rename(truth = {{truth_col}})  # standard name for yardstick
+
+  metrics_tbl <- metric_set(precision, recall, f_meas, roc_auc)(
+    data = preds,
+    truth = truth,
+    estimate = .pred_class,
+    .pred_Blue_Tarp)
+
+  result <- metrics_tbl %>%
+    select(.metric, .estimate) %>%
+    pivot_wider(names_from = .metric, values_from = .estimate) %>%
+    mutate(Model = model_name) %>%
+    select(Model, precision, recall, f_meas, roc_auc)
+  
+  return(result)}
+```
+
+
+```{r}
+#calc results 
+#LDA here
+lda_lin_results <- compare_test_results(lda_final_model, Testdat, truth_col = Class, model_name = "LDA")
+#QDA here 
+qda_lin_results <- compare_test_results(qda_final_model, Testdat, truth_col = Class, model_name = "QDA")
+knn_results <- compare_test_results(knn_final_model, Testdat, truth_col = Class, model_name = "KNN")
+lr_results <- compare_test_results(logreg_final_model, Testdat, truth_col = Class, model_name = "Log Reg")
+#RF here 
+randfor_results <- compare_test_results(rf_final_model, 
+                                   Testdat, 
+                                   truth_col=Class,
+                                   model_name="Random Forest")
+#SVM here
+svm_R_results <- compare_test_results(svm_final_model,
+                                    Testdat,
+                                    truth_col=Class,
+                                    model_name="SVM Poly")
+
+all_results <- bind_rows(lda_lin_results, qda_lin_results, knn_results, lr_results, 
+                         randfor_results, svm_R_results)
+all_results%>%
+  as_tibble() %>%
+  kable(
+    caption = "Comparison of All Models",
+    digits  = 3
+  )  %>% kableExtra::kable_styling(full_width=FALSE) 
+```
+
